@@ -1,0 +1,101 @@
+# 매일 새벽 Claude로 글 초안을 생성해 '초안 PR'을 여는 워크플로 (5장 2·3절)
+# 실제 발행은 사람이 PR을 검수하고 Merge할 때 배포 워크플로(hugo.yml)가 담당한다.
+name: Daily Draft (auto-generate)
+
+on:
+  schedule:
+    # 한국시간 새벽 6시 = UTC 전날 21시 (UTC는 한국보다 9시간 느림)
+    - cron: "0 21 * * *"
+  workflow_dispatch: # 깃허브 화면에서 수동 실행 버튼
+
+permissions:
+  contents: write # 새 브랜치에 커밋
+  pull-requests: write # 초안 PR 열기
+  issues: write # 실패/큐 소진 시 이슈 열기
+
+concurrency:
+  group: daily-draft
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    env:
+      # 시크릿이 등록돼 있는지 여부(빈 값이면 글 생성 단계를 건너뛴다)
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - name: 저장소 가져오기
+        uses: actions/checkout@v4
+
+      - name: API 키가 없으면 안내만 하고 종료
+        if: env.HAS_KEY != 'true'
+        run: echo "::warning::ANTHROPIC_API_KEY 시크릿이 없어 글 생성을 건너뜁니다. 저장소 Settings → Secrets and variables → Actions 에 등록하세요."
+
+      - name: 파이썬 설치
+        if: env.HAS_KEY == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 클로드 SDK 설치
+        if: env.HAS_KEY == 'true'
+        run: pip install --quiet anthropic
+
+      - name: 클로드로 글 생성
+        id: gen
+        if: env.HAS_KEY == 'true'
+        env:
+          # 금고(시크릿)에서 키를 꺼내 환경변수로만 전달 (코드엔 값이 없음)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/generate.py
+
+      - name: 초안 PR 열기 (사람 검수 게이트)
+        if: env.HAS_KEY == 'true' && steps.gen.outputs.generated == 'true'
+        # ※ create-pull-request 액션 버전은 예시(고정). 최신은 깃허브 마켓플레이스에서 확인.
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: auto-post/${{ steps.gen.outputs.slug }}
+          base: main
+          draft: true
+          add-paths: |
+            content/posts/
+            data/published.txt
+          commit-message: "auto: ${{ steps.gen.outputs.keyword }} 초안 생성"
+          title: "[자동초안] ${{ steps.gen.outputs.title }}"
+          body: |
+            🤖 자동 생성된 초안입니다. **발행 전 아래를 검수**하고, 문제 없으면 Merge(→ 자동 배포), 아니면 Close 하세요.
+
+            - 키워드: `${{ steps.gen.outputs.keyword }}`
+            - [ ] 수치(세율·한도·날짜)를 국세청 등 공식 자료로 확인
+            - [ ] 첫 문단만 읽고 검색자 질문에 답이 되는지(두괄식)
+            - [ ] 다른 글과 통째로 겹치는 일반론은 없는지
+            - [ ] 투자 권유로 읽힐 표현은 없는지, 면책 문구가 있는지
+            - [ ] `[경험 추가 필요]` 표시가 있으면 내 경험 한 줄 채우기
+
+            > 이 글은 `draft: false`로 생성됩니다. **Merge하는 순간 발행**되니, 검수 전에는 Merge하지 마세요.
+
+      - name: 키워드 큐 소진 시 이슈 열기
+        if: env.HAS_KEY == 'true' && steps.gen.outputs.generated == 'false' && steps.gen.outputs.reason == 'queue_exhausted'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "키워드 큐 소진 — keywords.csv 보충 필요",
+              body: "자동 발행할 새 키워드가 없습니다. 3장의 키워드 발굴법으로 keywords.csv에 키워드를 추가하세요."
+            });
+
+      - name: 실패하면 알림 이슈 자동 생성
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const day = new Date().toISOString().slice(0, 10);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `자동 초안 생성 실패 — ${day}`,
+              body: `워크플로 'Daily Draft'가 실패했습니다.\n\n실행 로그: ${runUrl}\n\n로그의 에러 부분을 복사해 클로드 코드에 붙여넣고 원인/수정안을 물어보세요.`
+            });

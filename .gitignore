@@ -3,6 +3,10 @@
 /resources/_gen/
 .hugo_build.lock
 
+# Python
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db
